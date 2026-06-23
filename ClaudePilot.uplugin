@@ -1,0 +1,19 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "Claude Pilot",
+	"Description": "Drive Unreal Engine creation through Claude - prompt box, task checklist, pipeline tools.",
+	"Category": "Editor",
+	"CreatedBy": "Nathan",
+	"CanContainContent": true,
+	"IsBetaVersion": true,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "ClaudePilot",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	]
+}
