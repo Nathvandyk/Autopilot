@@ -4,9 +4,13 @@
 #include "Services/FOllamaClient.h"
 #include "Services/FListReconciler.h"
 #include "Services/FClaudeBridge.h"
+#include "Services/FClaudePilotMonitor.h"
 #include "Config/ClaudePilotConstants.h"
 #include "UI/SClaudePilotPanel.h"
 
+#include "Editor.h"
+#include "Misc/CoreDelegates.h"
+#include "Interfaces/IMainFrameModule.h"
 #include "Framework/Commands/UICommandList.h"
 #include "Framework/Docking/TabManager.h"
 #include "Widgets/Docking/SDockTab.h"
@@ -36,10 +40,34 @@ void FClaudePilotModule::StartupModule()
 	Reconciler = MakeShared<FListReconciler>(Controller.ToSharedRef(), Ollama.ToSharedRef());
 	Bridge = MakeShared<FClaudeBridge>(ClaudePilot::DefaultClaudePath, ClaudePilot::DefaultMcpUrl);
 
+	// 1b. Editor-context monitor. Needs GEditor; defer to post-engine-init if it
+	//     isn't up yet when this module loads.
+	Monitor = MakeShared<FClaudePilotMonitor>();
+	if (GEditor)
+	{
+		Monitor->Start();
+	}
+	else
+	{
+		PostEngineInitHandle = FCoreDelegates::OnPostEngineInit.AddLambda([this]()
+		{
+			if (Monitor.IsValid()) { Monitor->Start(); }
+		});
+	}
+
 	// 2. Commands + the action that opens the panel.
 	FClaudePilotCommands::Register();
 	CommandList = MakeShared<FUICommandList>();
 	CommandList->MapAction(
+		FClaudePilotCommands::Get().OpenPanel,
+		FExecuteAction::CreateRaw(this, &FClaudePilotModule::OpenPanelTab),
+		FCanExecuteAction());
+
+	// Also bind the open command globally (main-frame bindings) so the shortcut
+	// works from any editor window - including asset editors like the material
+	// editor, whose Window menu doesn't have our entry.
+	IMainFrameModule& MainFrame = FModuleManager::LoadModuleChecked<IMainFrameModule>(TEXT("MainFrame"));
+	MainFrame.GetMainFrameCommandBindings()->MapAction(
 		FClaudePilotCommands::Get().OpenPanel,
 		FExecuteAction::CreateRaw(this, &FClaudePilotModule::OpenPanelTab),
 		FCanExecuteAction());
@@ -65,7 +93,23 @@ void FClaudePilotModule::ShutdownModule()
 
 	FGlobalTabmanager::Get()->UnregisterNomadTabSpawner(ClaudePilotTabName);
 
+	if (FModuleManager::Get().IsModuleLoaded(TEXT("MainFrame")))
+	{
+		IMainFrameModule& MainFrame = FModuleManager::GetModuleChecked<IMainFrameModule>(TEXT("MainFrame"));
+		MainFrame.GetMainFrameCommandBindings()->UnmapAction(FClaudePilotCommands::Get().OpenPanel);
+	}
+
 	FClaudePilotCommands::Unregister();
+
+	if (PostEngineInitHandle.IsValid())
+	{
+		FCoreDelegates::OnPostEngineInit.Remove(PostEngineInitHandle);
+	}
+	if (Monitor.IsValid())
+	{
+		Monitor->Stop();
+	}
+	Monitor.Reset();
 
 	CommandList.Reset();
 	Bridge.Reset();
@@ -80,7 +124,7 @@ TSharedRef<SDockTab> FClaudePilotModule::OnSpawnPanelTab(const FSpawnTabArgs& Ar
 	return SNew(SDockTab)
 		.TabRole(ETabRole::NomadTab)
 		[
-			SNew(SClaudePilotPanel, Controller.ToSharedRef(), Reconciler.ToSharedRef(), Bridge.ToSharedRef())
+			SNew(SClaudePilotPanel, Controller.ToSharedRef(), Reconciler.ToSharedRef(), Bridge.ToSharedRef(), Monitor.ToSharedRef(), Ollama.ToSharedRef())
 		];
 }
 

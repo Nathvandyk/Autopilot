@@ -42,6 +42,14 @@ namespace ClaudePilot
 		TEXT("- claudepilot_assets.ClaudePilotAssetsToolset: create_color_material, create_material_instance, create_blueprint, assign_material.\n")
 		TEXT("- claudepilot_source.ClaudePilotSourceToolset: create_script, write_script, read_script, list_scripts\n")
 		TEXT("  (game C++; a NEW class needs the user to build + restart before use).\n")
+		TEXT("Epic's EditorToolset is registered too and is your PRIMARY toolkit for engine work:\n")
+		TEXT("- ActorTools / SceneTools: place / move / organize actors, load levels.\n")
+		TEXT("- ObjectTools: get/set properties on any object (incl. Blueprint defaults); discover classes.\n")
+		TEXT("- BlueprintTools: full Blueprint authoring - variables, functions, events, graph nodes.\n")
+		TEXT("  For graph logic call get_graph_dsl_docs then write_graph_dsl; compile_blueprint when done.\n")
+		TEXT("- MaterialTools, Static/SkeletalMeshTools, DataTable/Texture tools for those asset types.\n")
+		TEXT("- ProgrammaticToolset: batch several tool calls in one sandboxed script for multi-step work.\n")
+		TEXT("Always describe_toolset before first use of a toolset to get exact tool names + args.\n")
 		TEXT("\n")
 		TEXT("How to work:\n")
 		TEXT("1) Read the checklist with list_items (it is also shown below).\n")
@@ -71,4 +79,37 @@ namespace ClaudePilot
 		TEXT("\n")
 		TEXT("Output ONLY a concise NUMBERED list of specific, actionable suggestions. For each,\n")
 		TEXT("name the actor or file it concerns and why it helps. Do not modify anything.");
+
+	/** Direct mode (the "Use checklist" box is OFF): Claude just does the user's
+	 *  prompt with the tools - no checklist run. MCP is always available. */
+	inline constexpr const TCHAR* AgentDirectPreamble =
+		TEXT("You are ClaudePilot, acting inside the Unreal Engine editor by calling tools on the\n")
+		TEXT("connected \"unreal-mcp\" server (Tool Search is ON, invoke with call_tool; set\n")
+		TEXT("toolset_name to the FULL name, e.g. claudepilot_world.ClaudePilotWorldToolset).\n")
+		TEXT("Toolsets: claudepilot_world (spawn / list_actors / set_actor_location / delete_actor),\n")
+		TEXT("claudepilot_properties (describe_actor / get_property / set_property - snake_case names,\n")
+		TEXT("component props need component_class), claudepilot_assets (create_color_material /\n")
+		TEXT("create_material_instance / create_blueprint / assign_material), claudepilot_source\n")
+		TEXT("(create_script / write_script / read_script / list_scripts - game C++, a new class\n")
+		TEXT("needs a build + restart). Epic's EditorToolset is your PRIMARY engine toolkit: ActorTools/\n")
+		TEXT("SceneTools (actors/levels), ObjectTools (any object's properties + class discovery),\n")
+		TEXT("BlueprintTools (Blueprints incl. a graph DSL: get_graph_dsl_docs then write_graph_dsl),\n")
+		TEXT("MaterialTools, mesh/data-table tools, and ProgrammaticToolset to batch calls. Always\n")
+		TEXT("describe_toolset before first use. Do what the user asks below using these tools. Keep\n")
+		TEXT("your text brief - the tools do the work.");
+
+	/** Handed to Ollama to tidy/reorganize the checklist after a checklist run. */
+	inline constexpr const TCHAR* ChecklistTidyReport =
+		TEXT("Claude has finished a run on the checklist. Reorganize and tidy it: keep completed ")
+		TEXT("items marked done, remove exact duplicates, and order the remaining items in a ")
+		TEXT("sensible sequence. Do not add new tasks.");
+
+	/** System prompt for Ollama to summarize the editor activity log into a short
+	 *  "what the user is working on" line. format=json is always on, so we ask for
+	 *  {"summary":"..."} and parse it. */
+	inline constexpr const TCHAR* ContextSummarySystem =
+		TEXT("You summarize what a user is doing in the Unreal Engine editor from a short ")
+		TEXT("activity log. Name the SPECIFIC editor, asset and any selected objects from the log ")
+		TEXT("(e.g. \"Editing the M_Green material's shader graph\" or \"Selected Cube in the level\"). ")
+		TEXT("Reply ONLY as JSON: {\"summary\": \"<one concise present-tense sentence>\"}.");
 }

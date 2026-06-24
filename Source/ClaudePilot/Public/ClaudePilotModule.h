@@ -7,6 +7,7 @@ class FClaudePilotController;
 class FOllamaClient;
 class FListReconciler;
 class FClaudeBridge;
+class FClaudePilotMonitor;
 class FUICommandList;
 class SDockTab;
 class FSpawnTabArgs;
@@ -43,4 +44,6 @@ private:
 	TSharedPtr<FOllamaClient> Ollama;
 	TSharedPtr<FListReconciler> Reconciler;
 	TSharedPtr<FClaudeBridge> Bridge;
+	TSharedPtr<FClaudePilotMonitor> Monitor;
+	FDelegateHandle PostEngineInitHandle;
 };

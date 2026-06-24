@@ -2,7 +2,14 @@
 #include "Controller/FClaudePilotController.h"
 #include "Services/FListReconciler.h"
 #include "Services/FClaudeBridge.h"
+#include "Services/FClaudePilotMonitor.h"
+#include "Services/FOllamaClient.h"
 #include "Config/ClaudePilotConstants.h"
+#include "Model/ClaudePilotSelection.h"
+#include "PropertyEditorModule.h"
+#include "IDetailsView.h"
+#include "GameFramework/Actor.h"
+#include "UObject/Package.h"
 
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/Text/STextBlock.h"
@@ -10,6 +17,8 @@
 #include "Widgets/Input/SMultiLineEditableTextBox.h"
 #include "Widgets/Input/SEditableTextBox.h"
 #include "Widgets/Input/SCheckBox.h"
+#include "SAssetDropTarget.h"
+#include "AssetRegistry/AssetData.h"
 #include "Widgets/Views/SListView.h"
 #include "Widgets/Views/STableRow.h"
 #include "Widgets/Layout/SBorder.h"
@@ -18,19 +27,45 @@
 #include "Styling/AppStyle.h"
 #include "Styling/CoreStyle.h"
 #include "Misc/DateTime.h"
+#include "Dom/JsonObject.h"
+#include "Serialization/JsonSerializer.h"
 
 #define LOCTEXT_NAMESPACE "ClaudePilot"
 
 void SClaudePilotPanel::Construct(const FArguments& InArgs,
 	TSharedRef<FClaudePilotController> InController,
 	TSharedRef<FListReconciler> InReconciler,
-	TSharedRef<FClaudeBridge> InBridge)
+	TSharedRef<FClaudeBridge> InBridge,
+	TSharedRef<FClaudePilotMonitor> InMonitor,
+	TSharedRef<FOllamaClient> InOllama)
 {
 	Controller = InController;
 	Reconciler = InReconciler;
 	Bridge = InBridge;
+	Monitor = InMonitor;
+	Ollama = InOllama;
 
 	TaskListChangedHandle = Controller->OnTaskListChanged.AddSP(this, &SClaudePilotPanel::RefreshList);
+	ContextChangedHandle = Monitor->OnContextChanged.AddSP(this, &SClaudePilotPanel::OnEditorContextChanged);
+
+	// Two object-reference lists, rendered with the native property picker (just
+	// like a UPROPERTY(EditAnywhere) TArray<AActor*> on a game class). Rooted so GC
+	// keeps them alive while the panel exists.
+	FPropertyEditorModule& PropMod = FModuleManager::LoadModuleChecked<FPropertyEditorModule>(TEXT("PropertyEditor"));
+	FDetailsViewArgs DetailsArgs;
+	DetailsArgs.bAllowSearch = false;
+	DetailsArgs.bHideSelectionTip = true;
+	DetailsArgs.NameAreaSettings = FDetailsViewArgs::HideNameArea;
+
+	PromptSelection = NewObject<UClaudePilotSelection>(GetTransientPackage());
+	PromptSelection->AddToRoot();
+	PromptSelectionView = PropMod.CreateDetailView(DetailsArgs);
+	PromptSelectionView->SetObject(PromptSelection);
+
+	TaskSelection = NewObject<UClaudePilotSelection>(GetTransientPackage());
+	TaskSelection->AddToRoot();
+	TaskSelectionView = PropMod.CreateDetailView(DetailsArgs);
+	TaskSelectionView->SetObject(TaskSelection);
 
 	ChildSlot
 	[
@@ -43,19 +78,25 @@ void SClaudePilotPanel::Construct(const FArguments& InArgs,
 		]
 		+ SVerticalBox::Slot().AutoHeight().Padding(8.f, 0.f, 8.f, 4.f)
 		[
-			SAssignNew(PromptBox, SMultiLineEditableTextBox)
-			.HintText(LOCTEXT("PromptHint", "Tell Claude what to build..."))
+			SNew(SAssetDropTarget)
+			.bSupportsMultiDrop(true)
+			.OnAreAssetsAcceptableForDrop_Lambda([](TArrayView<FAssetData>) { return true; })
+			.OnAssetsDropped(this, &SClaudePilotPanel::OnAssetsDroppedOnPrompt)
+			[
+				SAssignNew(PromptBox, SMultiLineEditableTextBox)
+				.HintText(LOCTEXT("PromptHint", "Tell Claude what to build...  (drop assets here to reference them)"))
+			]
 		]
 		+ SVerticalBox::Slot().AutoHeight().Padding(8.f, 0.f, 8.f, 2.f)
 		[
 			SNew(SHorizontalBox)
 			+ SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
 			[
-				SAssignNew(UseMcpCheck, SCheckBox)
+				SAssignNew(UseChecklistCheck, SCheckBox)
 				.IsChecked(ECheckBoxState::Checked)
-				.ToolTipText(LOCTEXT("UseMcpTip", "On: Claude can act in the editor via Epic's MCP. Off: plain chat."))
+				.ToolTipText(LOCTEXT("UseChecklistTip", "On: Claude works through the checklist top-to-bottom, then Ollama tidies it. Off: Claude just does your prompt with the tools."))
 				[
-					SNew(STextBlock).Text(LOCTEXT("UseMcp", "Control Unreal Engine (MCP)"))
+					SNew(STextBlock).Text(LOCTEXT("UseChecklist", "Use checklist"))
 				]
 			]
 			+ SHorizontalBox::Slot().AutoWidth()
@@ -65,6 +106,32 @@ void SClaudePilotPanel::Construct(const FArguments& InArgs,
 				.OnClicked(this, &SClaudePilotPanel::OnSendClaudeClicked)
 			]
 		]
+		// --- Editor context (the monitor: where you are + Ollama summary) ---
+		+ SVerticalBox::Slot().AutoHeight().Padding(8.f, 2.f, 8.f, 0.f)
+		[
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
+			[
+				SAssignNew(ContextLine, STextBlock)
+				.Text(LOCTEXT("CtxInit", "Working in: Level editor"))
+				.ColorAndOpacity(FSlateColor(FLinearColor(0.55f, 0.75f, 0.95f)))
+			]
+			+ SHorizontalBox::Slot().AutoWidth()
+			[
+				SNew(SButton)
+				.Text(LOCTEXT("CtxRefresh", "Refresh"))
+				.ToolTipText(LOCTEXT("CtxRefreshTip", "Ask Ollama to re-summarize what you're working on"))
+				.OnClicked_Lambda([this]() { RefreshContextSummary(); return FReply::Handled(); })
+			]
+		]
+		+ SVerticalBox::Slot().AutoHeight().Padding(8.f, 0.f, 8.f, 4.f)
+		[
+			SAssignNew(ContextSummaryText, STextBlock)
+			.Text(FText::GetEmpty())
+			.AutoWrapText(true)
+			.ColorAndOpacity(FSlateColor(FLinearColor(0.85f, 0.85f, 0.92f)))
+		]
+
 		+ SVerticalBox::Slot().AutoHeight().Padding(8.f, 0.f, 8.f, 2.f)
 		[
 			SAssignNew(ClaudeStatus, STextBlock).Text(FText::GetEmpty())
@@ -76,6 +143,21 @@ void SClaudePilotPanel::Construct(const FArguments& InArgs,
 				SAssignNew(ResponseBox, SMultiLineEditableTextBox)
 				.IsReadOnly(true)
 				.HintText(LOCTEXT("ResponseHint", "Claude's reply appears here"))
+			]
+		]
+
+		+ SVerticalBox::Slot().AutoHeight().Padding(8.f, 0.f) [ SNew(SSeparator) ]
+
+		// --- Prompt objects (native actor-ref list; like UPROPERTY TArray<AActor*>) ---
+		+ SVerticalBox::Slot().AutoHeight().Padding(8.f, 4.f, 8.f, 2.f)
+		[
+			SNew(STextBlock).Text(LOCTEXT("PromptObjLabel", "Prompt objects (Claude acts on these)"))
+		]
+		+ SVerticalBox::Slot().AutoHeight().Padding(8.f, 0.f, 8.f, 6.f)
+		[
+			SNew(SBox).MaxDesiredHeight(170.f)
+			[
+				PromptSelectionView.ToSharedRef()
 			]
 		]
 
@@ -97,8 +179,25 @@ void SClaudePilotPanel::Construct(const FArguments& InArgs,
 		]
 		+ SVerticalBox::Slot().AutoHeight().Padding(8.f, 0.f, 8.f, 4.f)
 		[
-			SAssignNew(DescBox, SMultiLineEditableTextBox)
-			.HintText(LOCTEXT("DescHint", "Description - what to do for this step..."))
+			SNew(SAssetDropTarget)
+			.bSupportsMultiDrop(true)
+			.OnAreAssetsAcceptableForDrop_Lambda([](TArrayView<FAssetData>) { return true; })
+			.OnAssetsDropped(this, &SClaudePilotPanel::OnAssetsDroppedOnDesc)
+			[
+				SAssignNew(DescBox, SMultiLineEditableTextBox)
+				.HintText(LOCTEXT("DescHint", "Description - what to do for this step...  (drop assets here)"))
+			]
+		]
+		+ SVerticalBox::Slot().AutoHeight().Padding(8.f, 0.f, 8.f, 2.f)
+		[
+			SNew(STextBlock).Text(LOCTEXT("TaskObjLabel", "Objects for this step (optional)"))
+		]
+		+ SVerticalBox::Slot().AutoHeight().Padding(8.f, 0.f, 8.f, 6.f)
+		[
+			SNew(SBox).MaxDesiredHeight(150.f)
+			[
+				TaskSelectionView.ToSharedRef()
+			]
 		]
 		+ SVerticalBox::Slot().AutoHeight().Padding(8.f, 0.f, 8.f, 8.f).HAlign(HAlign_Right)
 		[
@@ -218,6 +317,9 @@ void SClaudePilotPanel::Construct(const FArguments& InArgs,
 	];
 
 	RefreshList();
+
+	// Seed the context line + summary from the monitor's current state.
+	OnEditorContextChanged();
 }
 
 SClaudePilotPanel::~SClaudePilotPanel()
@@ -225,6 +327,20 @@ SClaudePilotPanel::~SClaudePilotPanel()
 	if (Controller.IsValid())
 	{
 		Controller->OnTaskListChanged.Remove(TaskListChangedHandle);
+	}
+	if (Monitor.IsValid())
+	{
+		Monitor->OnContextChanged.Remove(ContextChangedHandle);
+	}
+	if (PromptSelection)
+	{
+		PromptSelection->RemoveFromRoot();
+		PromptSelection = nullptr;
+	}
+	if (TaskSelection)
+	{
+		TaskSelection->RemoveFromRoot();
+		TaskSelection = nullptr;
 	}
 }
 
@@ -247,7 +363,34 @@ void SClaudePilotPanel::CommitNewTask()
 		return;
 	}
 
-	const FString Desc = DescBox.IsValid() ? DescBox->GetText().ToString() : FString();
+	FString Desc = DescBox.IsValid() ? DescBox->GetText().ToString() : FString();
+
+	// Bake any picked objects into this item's description.
+	if (TaskSelection && TaskSelection->Actors.Num() > 0)
+	{
+		FString Objs;
+		for (const TObjectPtr<AActor>& A : TaskSelection->Actors)
+		{
+			if (!A)
+			{
+				continue;
+			}
+			if (!Objs.IsEmpty())
+			{
+				Objs += TEXT(", ");
+			}
+			Objs += A->GetActorLabel();
+		}
+		if (!Objs.IsEmpty())
+		{
+			if (!Desc.IsEmpty())
+			{
+				Desc += TEXT(" ");
+			}
+			Desc += FString::Printf(TEXT("[objects: %s]"), *Objs);
+		}
+	}
+
 	Controller->AddTask(Title, Desc);
 
 	TitleBox->SetText(FText::GetEmpty());
@@ -255,6 +398,47 @@ void SClaudePilotPanel::CommitNewTask()
 	{
 		DescBox->SetText(FText::GetEmpty());
 	}
+	if (TaskSelection)
+	{
+		TaskSelection->Actors.Empty();
+		if (TaskSelectionView.IsValid())
+		{
+			TaskSelectionView->ForceRefresh();
+		}
+	}
+}
+
+void SClaudePilotPanel::OnAssetsDroppedOnPrompt(const FDragDropEvent& /*Event*/, TArrayView<FAssetData> Assets)
+{
+	AppendAssetRefs(PromptBox, Assets);
+}
+
+void SClaudePilotPanel::OnAssetsDroppedOnDesc(const FDragDropEvent& /*Event*/, TArrayView<FAssetData> Assets)
+{
+	AppendAssetRefs(DescBox, Assets);
+}
+
+void SClaudePilotPanel::AppendAssetRefs(const TSharedPtr<SMultiLineEditableTextBox>& Box, TArrayView<FAssetData> Assets)
+{
+	if (!Box.IsValid())
+	{
+		return;
+	}
+	FString Text = Box->GetText().ToString();
+	for (const FAssetData& Asset : Assets)
+	{
+		const FString Path = Asset.GetObjectPathString();
+		if (Path.IsEmpty())
+		{
+			continue;
+		}
+		if (!Text.IsEmpty() && !Text.EndsWith(TEXT("\n")) && !Text.EndsWith(TEXT(" ")))
+		{
+			Text += TEXT(" ");
+		}
+		Text += Path;
+	}
+	Box->SetText(FText::FromString(Text));
 }
 
 FReply SClaudePilotPanel::OnDoneClicked()
@@ -275,10 +459,98 @@ FReply SClaudePilotPanel::OnDoneClicked()
 	return FReply::Handled();
 }
 
+FString SClaudePilotPanel::BuildContextBlock() const
+{
+	if (!Monitor.IsValid())
+	{
+		return FString();
+	}
+	FString Block = TEXT("EDITOR CONTEXT (where the user is working right now):\n");
+	Block += FString::Printf(TEXT("Active: %s\n"), *Monitor->GetCurrentContext());
+	if (!ContextSummary.IsEmpty())
+	{
+		Block += FString::Printf(TEXT("Doing: %s\n"), *ContextSummary);
+	}
+	const FString Recent = Monitor->GetRecentActivity(10);
+	if (!Recent.IsEmpty())
+	{
+		Block += TEXT("Recent activity:\n");
+		Block += Recent;
+	}
+	if (PromptSelection && PromptSelection->Actors.Num() > 0)
+	{
+		Block += TEXT("User-selected objects to act on: ");
+		bool bFirst = true;
+		for (const TObjectPtr<AActor>& A : PromptSelection->Actors)
+		{
+			if (!A)
+			{
+				continue;
+			}
+			if (!bFirst)
+			{
+				Block += TEXT(", ");
+			}
+			Block += A->GetActorLabel();
+			bFirst = false;
+		}
+		Block += TEXT("\n");
+	}
+	Block += TEXT("If the request refers to where the user is (e.g. \"this graph\", \"here\"), act in that editor/asset.\n\n");
+	return Block;
+}
+
+void SClaudePilotPanel::OnEditorContextChanged()
+{
+	if (ContextLine.IsValid() && Monitor.IsValid())
+	{
+		ContextLine->SetText(FText::FromString(
+			FString::Printf(TEXT("Working in: %s"), *Monitor->GetCurrentContext())));
+	}
+	RefreshContextSummary();
+}
+
+void SClaudePilotPanel::RefreshContextSummary()
+{
+	if (!Ollama.IsValid() || !Monitor.IsValid() || bSummaryInFlight)
+	{
+		return;
+	}
+	bSummaryInFlight = true;
+
+	TWeakPtr<SClaudePilotPanel> WeakSelf = StaticCastSharedRef<SClaudePilotPanel>(AsShared());
+	Ollama->Chat(ClaudePilot::ContextSummarySystem, Monitor->GetRecentActivity(20),
+		[WeakSelf](bool bOk, const FString& Content, const FString& /*Error*/)
+		{
+			const TSharedPtr<SClaudePilotPanel> Self = WeakSelf.Pin();
+			if (!Self.IsValid()) { return; }
+			Self->bSummaryInFlight = false;
+			if (!bOk) { return; }
+
+			// Ollama runs with format=json -> {"summary":"..."}.
+			FString Summary;
+			TSharedPtr<FJsonObject> Obj;
+			const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Content);
+			if (FJsonSerializer::Deserialize(Reader, Obj) && Obj.IsValid())
+			{
+				Obj->TryGetStringField(TEXT("summary"), Summary);
+			}
+			if (Summary.IsEmpty()) { Summary = Content; }
+
+			Self->ContextSummary = Summary;
+			if (Self->ContextSummaryText.IsValid())
+			{
+				Self->ContextSummaryText->SetText(FText::FromString(Summary));
+			}
+		});
+}
+
 FString SClaudePilotPanel::ComposeAgentPrompt(const FString& UserGoal) const
 {
 	FString Out = ClaudePilot::AgentSystemPreamble;
-	Out += TEXT("\n\nCURRENT CHECKLIST:\n");
+	Out += TEXT("\n\n");
+	Out += BuildContextBlock();
+	Out += TEXT("CURRENT CHECKLIST:\n");
 
 	if (Controller.IsValid() && Controller->GetTasks().Num() > 0)
 	{
@@ -316,6 +588,33 @@ FString SClaudePilotPanel::ComposeAgentPrompt(const FString& UserGoal) const
 	return Out;
 }
 
+FString SClaudePilotPanel::ComposeDirectPrompt(const FString& UserGoal) const
+{
+	FString Out = ClaudePilot::AgentDirectPreamble;
+	Out += TEXT("\n\n");
+	Out += BuildContextBlock();
+	Out += TEXT("USER INSTRUCTION:\n");
+	Out += UserGoal;
+	return Out;
+}
+
+void SClaudePilotPanel::RunChecklistTidy()
+{
+	if (!Reconciler.IsValid())
+	{
+		return;
+	}
+	AppendLog(TEXT("Asking Ollama to tidy the checklist..."));
+	TWeakPtr<SClaudePilotPanel> WeakSelf = StaticCastSharedRef<SClaudePilotPanel>(AsShared());
+	Reconciler->ReconcileWithReport(ClaudePilot::ChecklistTidyReport, [WeakSelf](const FString& Summary)
+	{
+		if (const TSharedPtr<SClaudePilotPanel> Self = WeakSelf.Pin())
+		{
+			Self->AppendLog(FString::Printf(TEXT("Ollama: %s"), *Summary));
+		}
+	});
+}
+
 FReply SClaudePilotPanel::OnSendClaudeClicked()
 {
 	if (!Bridge.IsValid() || !PromptBox.IsValid())
@@ -324,32 +623,31 @@ FReply SClaudePilotPanel::OnSendClaudeClicked()
 	}
 
 	const FString UserPrompt = PromptBox->GetText().ToString();
-	const bool bWithMcp = UseMcpCheck.IsValid() && UseMcpCheck->IsChecked();
+	const bool bUseChecklist = UseChecklistCheck.IsValid() && UseChecklistCheck->IsChecked();
 
-	// Chat mode needs something to say; agent (MCP) mode can just run the checklist.
-	if (UserPrompt.TrimStartAndEnd().IsEmpty() && !bWithMcp)
+	// Checklist mode can run with an empty prompt (= "execute the checklist");
+	// direct mode needs an instruction to act on.
+	if (UserPrompt.TrimStartAndEnd().IsEmpty() && !bUseChecklist)
 	{
 		return FReply::Handled();
 	}
 
-	// With MCP on, prepend the operating instructions + the live checklist so a
-	// Send means "execute my list with the tools".
-	const FString Prompt = bWithMcp ? ComposeAgentPrompt(UserPrompt) : UserPrompt;
+	// MCP is always on. Checklist mode injects the live list + run-it instructions;
+	// direct mode just hands Claude the tools and the user's prompt.
+	const FString Prompt = bUseChecklist ? ComposeAgentPrompt(UserPrompt) : ComposeDirectPrompt(UserPrompt);
 
 	if (ClaudeStatus.IsValid())
 	{
-		ClaudeStatus->SetText(bWithMcp
-			? LOCTEXT("ClaudeWorking", "Claude is working in the editor...")
-			: LOCTEXT("ClaudeThinking", "Claude is thinking..."));
+		ClaudeStatus->SetText(LOCTEXT("ClaudeWorking", "Claude is working in the editor..."));
 	}
 	if (ResponseBox.IsValid())
 	{
 		ResponseBox->SetText(FText::GetEmpty());
 	}
-	AppendLog(bWithMcp ? TEXT("Sent prompt to Claude (MCP on).") : TEXT("Sent prompt to Claude (chat)."));
+	AppendLog(bUseChecklist ? TEXT("Sent to Claude (running the checklist).") : TEXT("Sent to Claude (direct)."));
 
 	TWeakPtr<SClaudePilotPanel> WeakSelf = StaticCastSharedRef<SClaudePilotPanel>(AsShared());
-	Bridge->Run(Prompt, bWithMcp,
+	Bridge->Run(Prompt, /*bWithUnrealMcp*/ true,
 		[WeakSelf](const FString& Line)
 		{
 			const TSharedPtr<SClaudePilotPanel> Self = WeakSelf.Pin();
@@ -360,7 +658,7 @@ FReply SClaudePilotPanel::OnSendClaudeClicked()
 				Self->ClaudeStatus->SetText(FText::FromString(Line.Left(120)));
 			}
 		},
-		[WeakSelf](bool bOk, const FString& Output, const FString& Error)
+		[WeakSelf, bUseChecklist](bool bOk, const FString& Output, const FString& Error)
 		{
 			const TSharedPtr<SClaudePilotPanel> Self = WeakSelf.Pin();
 			if (!Self.IsValid()) { return; }
@@ -375,6 +673,12 @@ FReply SClaudePilotPanel::OnSendClaudeClicked()
 					: LOCTEXT("ClaudeError", "Error (see reply box)."));
 			}
 			Self->AppendLog(bOk ? TEXT("Claude finished.") : FString::Printf(TEXT("Claude error: %s"), *Error));
+
+			// Checklist mode hands off to Ollama to tidy/reorganize the list.
+			if (bOk && bUseChecklist)
+			{
+				Self->RunChecklistTidy();
+			}
 		});
 
 	return FReply::Handled();
