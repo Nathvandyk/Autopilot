@@ -23,6 +23,7 @@
 #include "Widgets/Views/STableRow.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Layout/SBox.h"
+#include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/Layout/SSeparator.h"
 #include "Styling/AppStyle.h"
 #include "Styling/CoreStyle.h"
@@ -69,7 +70,10 @@ void SClaudePilotPanel::Construct(const FArguments& InArgs,
 
 	ChildSlot
 	[
-		SNew(SVerticalBox)
+		SNew(SScrollBox)
+		+ SScrollBox::Slot()
+		[
+			SNew(SVerticalBox)
 
 		// --- Prompt -> Claude ---
 		+ SVerticalBox::Slot().AutoHeight().Padding(8.f, 8.f, 8.f, 4.f)
@@ -213,15 +217,18 @@ void SClaudePilotPanel::Construct(const FArguments& InArgs,
 		[
 			SNew(STextBlock).Text(LOCTEXT("ChecklistLabel", "Checklist"))
 		]
-		+ SVerticalBox::Slot().FillHeight(1.f).Padding(8.f, 0.f, 8.f, 4.f)
+		+ SVerticalBox::Slot().AutoHeight().Padding(8.f, 0.f, 8.f, 4.f)
 		[
-			SNew(SBorder)
-			.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+			SNew(SBox).MaxDesiredHeight(240.f)
 			[
-				SAssignNew(TaskListView, SListView<FClaudeTaskPtr>)
-				.ListItemsSource(&VisibleTasks)
-				.OnGenerateRow(this, &SClaudePilotPanel::OnGenerateTaskRow)
-				.SelectionMode(ESelectionMode::Multi)
+				SNew(SBorder)
+				.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+				[
+					SAssignNew(TaskListView, SListView<FClaudeTaskPtr>)
+					.ListItemsSource(&VisibleTasks)
+					.OnGenerateRow(this, &SClaudePilotPanel::OnGenerateTaskRow)
+					.SelectionMode(ESelectionMode::Multi)
+				]
 			]
 		]
 		+ SVerticalBox::Slot().AutoHeight().Padding(8.f, 0.f, 8.f, 8.f).HAlign(HAlign_Right)
@@ -314,6 +321,7 @@ void SClaudePilotPanel::Construct(const FArguments& InArgs,
 				.HintText(LOCTEXT("SuggestHint", "Improvement suggestions appear here after an optimize run"))
 			]
 		]
+		]
 	];
 
 	RefreshList();
@@ -369,17 +377,19 @@ void SClaudePilotPanel::CommitNewTask()
 	if (TaskSelection && TaskSelection->Actors.Num() > 0)
 	{
 		FString Objs;
-		for (const TObjectPtr<AActor>& A : TaskSelection->Actors)
+		for (const TSoftObjectPtr<AActor>& A : TaskSelection->Actors)
 		{
-			if (!A)
+			if (A.IsNull())
 			{
 				continue;
 			}
+			const AActor* Actor = A.Get();
+			const FString Name = Actor ? Actor->GetActorLabel() : A.ToString();
 			if (!Objs.IsEmpty())
 			{
 				Objs += TEXT(", ");
 			}
-			Objs += A->GetActorLabel();
+			Objs += Name;
 		}
 		if (!Objs.IsEmpty())
 		{
@@ -481,17 +491,19 @@ FString SClaudePilotPanel::BuildContextBlock() const
 	{
 		Block += TEXT("User-selected objects to act on: ");
 		bool bFirst = true;
-		for (const TObjectPtr<AActor>& A : PromptSelection->Actors)
+		for (const TSoftObjectPtr<AActor>& A : PromptSelection->Actors)
 		{
-			if (!A)
+			if (A.IsNull())
 			{
 				continue;
 			}
+			const AActor* Actor = A.Get();
+			const FString Name = Actor ? Actor->GetActorLabel() : A.ToString();
 			if (!bFirst)
 			{
 				Block += TEXT(", ");
 			}
-			Block += A->GetActorLabel();
+			Block += Name;
 			bFirst = false;
 		}
 		Block += TEXT("\n");
